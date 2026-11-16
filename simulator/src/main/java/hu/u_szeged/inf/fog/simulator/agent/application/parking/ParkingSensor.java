@@ -1,0 +1,367 @@
+package hu.u_szeged.inf.fog.simulator.agent.application.parking;
+
+import hu.mta.sztaki.lpds.cloud.simulator.Timed;
+import hu.mta.sztaki.lpds.cloud.simulator.iaas.resourcemodel.ConsumptionEventAdapter;
+import hu.mta.sztaki.lpds.cloud.simulator.io.NetworkNode;
+import hu.mta.sztaki.lpds.cloud.simulator.io.Repository;
+import hu.mta.sztaki.lpds.cloud.simulator.io.StorageObject;
+import hu.mta.sztaki.lpds.cloud.simulator.util.SeedSyncer;
+import hu.u_szeged.inf.fog.simulator.agent.demo.Config;
+import hu.u_szeged.inf.fog.simulator.agent.dt.ParkingCsvData;
+import hu.u_szeged.inf.fog.simulator.agent.util.ParkingTraceExporter;
+import hu.u_szeged.inf.fog.simulator.common.util.ScenarioBase;
+import hu.u_szeged.inf.fog.simulator.common.util.SimLogger;
+
+import java.util.*;
+
+public class ParkingSensor extends Timed {
+
+    public static ArrayList<ParkingSensor> allParkingSensors = new ArrayList<>();
+
+    public static int totalParkingEvents = 0;
+
+    public enum ParkingMode {
+        NBIOT_PUSH(15),
+
+        BLE_POLL(1);
+
+        public final int batteryCost;
+
+        ParkingMode(int batteryCost) {
+            this.batteryCost = batteryCost;
+        }
+    }
+
+    public enum ParkingProfile {
+
+        NORMAL(86_400_000.0 / 22.0), // ~3 927 273 ms
+        BUSY(3_600_000.0 / 12.0);    // 300 000 ms
+
+        private final double meanInterval;
+
+        ParkingProfile(double meanInterval) {
+            this.meanInterval = meanInterval;
+        }
+    }
+
+    public enum ParkingZone {
+
+        COMMERCIAL,
+        LOADING,
+        RESIDENTIAL
+    }
+
+    public enum TimePeriod {
+        NIGHT,
+        MORNING_PEAK,
+        DAYTIME,
+        EVENING_PEAK,
+        LATE_EVENING
+    }
+
+    public String id;
+
+    public ParkingMode mode;
+
+    public ParkingMode pendingMode;
+
+    public final ParkingZone zone;
+
+    public final Repository nbiotRepository;
+
+    public final Repository bleRepository;
+
+    private final ParkingTraceExporter traceExporter;
+
+    public record ParkingObservation(long simulationTimeMs, boolean occupied) {
+    }
+
+    public final Deque<ParkingObservation> observationHistory = new ArrayDeque<>();
+
+    public boolean isTaken = false;
+    public int eventCount = 0;
+
+    private final PlatformService platformService;
+
+    public int batteryLevel;
+
+    public long stopTime;
+
+    public int orchestrationIntervalEventCount = 0;
+
+    public int modeSwitchCount = 0;
+
+    public final String startMode;
+
+    private Deque<ParkingCsvData.ParkingEvent> parkingEvents;
+
+    public ParkingSensor(String id, PlatformService platformService, Repository nbiotRepository, Repository bleRepository, int batteryLevel,
+                         ParkingMode mode, ParkingZone zone, ParkingTraceExporter traceExporter) {
+        this.id = id;
+        this.nbiotRepository = nbiotRepository;
+        this.bleRepository = bleRepository;
+        this.mode = mode;
+        this.startMode = this.mode.toString();
+        this.pendingMode = null;
+        this.batteryLevel = batteryLevel;
+        this.zone = zone;
+        this.platformService = platformService;
+        this.stopTime = 0;
+        this.traceExporter = traceExporter;
+        String orchestrationStrategy = (String) Config.PARKING_CONFIGURATION.get("orchestrationStrategy");
+        if ("forecast".equals(orchestrationStrategy) || "forecast-2h".equals(orchestrationStrategy) || "forecast-lookahead".equals(orchestrationStrategy)) {
+            long historyWindowMs = (long) Config.PARKING_CONFIGURATION.get("forecastHistoryWindowMs");
+            addObservation(-historyWindowMs, isTaken);
+        }
+        subscribe(sampleNextEventDelay(getCurrentProfile().meanInterval));
+        allParkingSensors.add(this);
+        //this.batteryLevel = Config.PARKING_CONFIGURATION.get("batteryCapacity") instanceof Long capacity ? capacity : 0L; TODO:!!
+    }
+
+    public ParkingSensor(String id, PlatformService platformService, Repository nbiotRepository,
+                         Repository bleRepository, int batteryLevel, ParkingMode mode,
+                         ParkingZone zone, Deque<ParkingCsvData.ParkingEvent> parkingEvents) {
+        this.id = id;
+        this.nbiotRepository = nbiotRepository;
+        this.bleRepository = bleRepository;
+        this.mode = mode;
+        this.startMode = this.mode.toString();
+        this.batteryLevel = batteryLevel;
+        this.zone = zone;
+        this.platformService = platformService;
+        this.stopTime = 0;
+        this.traceExporter = null;
+        this.parkingEvents = parkingEvents;
+
+        if (!parkingEvents.isEmpty()) {
+            subscribe(parkingEvents.peek().simulationTimeMs());
+        }
+
+        allParkingSensors.add(this);
+    }
+
+    @Override
+    public void tick(long fires) {
+        this.isTaken = !this.isTaken;
+        if (traceExporter != null) {
+            traceExporter.logEvent(this);
+        }
+        eventCount++;
+        orchestrationIntervalEventCount++;
+        totalParkingEvents++;
+
+        String orchestrationStrategy = (String) Config.PARKING_CONFIGURATION.get("orchestrationStrategy");
+        if ("forecast".equals(orchestrationStrategy) || "forecast-2h".equals(orchestrationStrategy) || "forecast-lookahead".equals(orchestrationStrategy)) {
+            addObservation(Timed.getFireCount(), isTaken);
+        }
+
+        StorageObject so = new StorageObject(id + "-" + fires, 50, false);
+        PlatformService.networkTimePerFile.put(so.id, Timed.getFireCount());
+
+        if (this.mode == ParkingMode.NBIOT_PUSH) {
+            nbiotRepository.registerObject(so);
+            this.batteryLevel = Math.max(0, this.batteryLevel - ParkingMode.NBIOT_PUSH.batteryCost);
+
+            try {
+                nbiotRepository.requestContentDelivery(
+                        so.id,
+                        platformService.platformRepo,
+                        new ConsumptionEventAdapter() {
+                            @Override
+                            public void conComplete() {
+                                nbiotRepository.deregisterObject(so.id);
+                                platformService.platformRepo.deregisterObject(so.id);
+                                platformService.receivedDataSize += so.size;
+                                platformService.receivedEventCount++;
+
+                                long latency =
+                                        Timed.getFireCount() - PlatformService.networkTimePerFile.remove(so.id);
+
+                                platformService.latencies.add(latency);
+                                PlatformService.totalEndToEndLatency += latency;
+
+                                applyPendingReconfiguration(ParkingMode.BLE_POLL);
+
+                                SimLogger.logRun(
+                                        "File received in "
+                                                + (Timed.getFireCount() - fires)
+                                                + " ms. from "
+                                                + id
+                                                + " with NBIoT mode at "
+                                                + Timed.getFireCount() / ScenarioBase.MINUTE_IN_MILLISECONDS
+                                                + " min."
+                                );
+                            }
+                        }
+                );
+            } catch (NetworkNode.NetworkException e) {
+                throw new RuntimeException(e);
+            }
+        } else {
+            bleRepository.registerObject(so);
+        }
+
+        if (parkingEvents == null) {
+            TimePeriod period = resolveTimePeriod(Timed.getFireCount());
+            ParkingProfile currentProfile = resolveParkingProfile(zone, period);
+
+            updateFrequency(sampleNextEventDelay(currentProfile.meanInterval));
+        } else {
+            parkingEvents.poll();
+
+            if (parkingEvents.isEmpty()) {
+                unsubscribe();
+            } else {
+                long nextEventTime = parkingEvents.peek().simulationTimeMs();
+                updateFrequency(nextEventTime - Timed.getFireCount());
+            }
+        }
+
+        if (this.batteryLevel <= 0) {
+            unsubscribe();
+            this.stopTime = Timed.getFireCount();
+
+            SimLogger.logRun(
+                    "Sensor stopped at "
+                            + this.stopTime / ScenarioBase.MINUTE_IN_MILLISECONDS
+                            + " min."
+            );
+        }
+    }
+
+    private long sampleNextEventDelay(double meanIntervalMs) {
+        double randomValue = Math.max(1.0 - SeedSyncer.centralRnd.nextDouble(), 1e-12);
+
+        return Math.max(ScenarioBase.MINUTE_IN_MILLISECONDS, Math.round(-Math.log(randomValue) * meanIntervalMs)
+        );
+    }
+
+    public void addObservation(long simulationTimeMs, boolean occupied) {
+        observationHistory.addLast(new ParkingObservation(simulationTimeMs, occupied));
+        long historyWindowMs = (long) Config.PARKING_CONFIGURATION.get("forecastHistoryWindowMs");
+        long historyStartTimeMs = simulationTimeMs - historyWindowMs;
+
+        while (observationHistory.size() > 1) {
+            Iterator<ParkingObservation> iterator = observationHistory.iterator();
+            iterator.next();
+            ParkingObservation second = iterator.next();
+
+            if (second.simulationTimeMs() <= historyStartTimeMs) {
+                observationHistory.removeFirst();
+            } else {
+                break;
+            }
+        }
+    }
+
+    public boolean getOccupancyAt(long simulationTimeMs) {
+        boolean occupancy = observationHistory.peekFirst().occupied();
+
+        for (ParkingObservation observation : observationHistory) {
+            if (observation.simulationTimeMs() > simulationTimeMs) {
+                break;
+            }
+            occupancy = observation.occupied();
+        }
+
+        return occupancy;
+    }
+
+    public List<ParkingObservation> getObservationsBetween(long fromTimeMs, long toTimeMs) {
+        List<ParkingObservation> observations = new ArrayList<>();
+
+        for (ParkingObservation observation : observationHistory) {
+            if (observation.simulationTimeMs() > fromTimeMs && observation.simulationTimeMs() < toTimeMs) {
+                observations.add(observation);
+            }
+        }
+
+        return observations;
+    }
+
+    public int getTraceEventCountBetween(long fromTimeMs, long toTimeMs) {
+        if (parkingEvents == null) {
+            throw new IllegalStateException("Oracle forecasting requires trace workload");
+        }
+        int count = 0;
+        for (ParkingCsvData.ParkingEvent event : parkingEvents) {
+            if (event.simulationTimeMs() < fromTimeMs) {
+                continue;
+            }
+            if (event.simulationTimeMs() >= toTimeMs) {
+                break;
+            }
+            count++;
+        }
+        return count;
+    }
+
+    public void stop(){
+        unsubscribe();
+    }
+
+    public static TimePeriod resolveTimePeriod(long simulationTimeMs) {
+
+        long timeOfDay = simulationTimeMs % (24 * ScenarioBase.HOUR_IN_MILLISECONDS);
+
+        if (timeOfDay < 6 * ScenarioBase.HOUR_IN_MILLISECONDS) {
+            return TimePeriod.NIGHT;
+        }
+
+        if (timeOfDay < 9 * ScenarioBase.HOUR_IN_MILLISECONDS) {
+            return TimePeriod.MORNING_PEAK;
+        }
+
+        if (timeOfDay < 16 * ScenarioBase.HOUR_IN_MILLISECONDS) {
+            return TimePeriod.DAYTIME;
+        }
+
+        if (timeOfDay < 19 * ScenarioBase.HOUR_IN_MILLISECONDS) {
+            return TimePeriod.EVENING_PEAK;
+        }
+
+        return TimePeriod.LATE_EVENING;
+    }
+
+    public static ParkingProfile resolveParkingProfile(
+            ParkingZone zone,
+            TimePeriod period) {
+
+        return switch (zone) {
+            case COMMERCIAL -> switch (period) {
+                case MORNING_PEAK, DAYTIME, EVENING_PEAK -> ParkingProfile.BUSY;
+
+                case NIGHT, LATE_EVENING -> ParkingProfile.NORMAL;
+            };
+
+            case LOADING -> switch (period) {
+                case MORNING_PEAK -> ParkingProfile.BUSY;
+
+                case NIGHT, DAYTIME, EVENING_PEAK, LATE_EVENING -> ParkingProfile.NORMAL;
+            };
+
+            case RESIDENTIAL -> switch (period) {
+                case MORNING_PEAK, EVENING_PEAK -> ParkingProfile.BUSY;
+
+                case NIGHT, DAYTIME, LATE_EVENING -> ParkingProfile.NORMAL;
+            };
+        };
+    }
+
+    public ParkingProfile getCurrentProfile() {
+        return resolveParkingProfile(
+                zone,
+                resolveTimePeriod(Timed.getFireCount()));
+    }
+
+    public void applyPendingReconfiguration(ParkingMode expectedMode) {
+        if (pendingMode == expectedMode) {
+            ParkingMode previousMode = mode;
+            mode = pendingMode;
+            pendingMode = null;
+            modeSwitchCount++;
+            SimLogger.logRun( "Sensor " + id + " switched from " + previousMode + " to " + mode
+                            + " at " + Timed.getFireCount() / ScenarioBase.MINUTE_IN_MILLISECONDS + " min.");
+        }
+    }
+}

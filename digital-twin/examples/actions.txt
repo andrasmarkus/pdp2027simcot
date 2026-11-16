@@ -1,0 +1,21 @@
+{
+  "operations": [
+    {
+      "type": "component_migration",
+      "component_id": "server-1",
+      "source_node": "vm-1",
+      "target_node": "vm-2"
+    },
+    {
+      "type": "resource_scaling",
+      "node_id": "vm-1",
+      "cpu": 8,
+      "memory": 16384
+    },
+    {
+      "type": "component_scaling",
+      "component_id": "server-1",
+      "replicas": 3
+    }
+  ]
+}

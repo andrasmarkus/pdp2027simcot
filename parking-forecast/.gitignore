@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# uv virtual environment (uv.lock is committed)
+.venv/
+
+# notebooks and archives
+*.ipynb
+.ipynb_checkpoints/
+*.zip
+
+# data: local only, not on GitHub
+data/
+
+# model checkpoints: local only, not on GitHub
+checkpoints/
